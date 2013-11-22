@@ -24,39 +24,43 @@
 
 (defonce !last-id (atom 0))
 
-(defn new-user-id! []
-  (str "user-" (swap! !last-id inc)))
+(defn new-user-id! [{:keys [remote-addr] :as req}]
+  (str remote-addr "-" (swap! !last-id inc)))
 
-(defonce !connections (atom #{}))
+(defonce !open-chs (agent #{}))
 
-(defonce !recent-messages (agent []))
+(defonce !recent-messages (atom []))
 
-(defn send-messages-to-client! [messages ch]
-  (->> messages
-       reverse
-       pr-str
-       (a/put! ch)))
+(defn push-messages! [messages ch]
+  (a/put! ch (pr-str (reverse messages))))
 
-(defn process-message! [messages id {:keys [chat]}]
-  (let [new-messages (take 10 (cons {:id id :chat chat} messages))]
-    (doseq [ch @!connections]
-      (send-messages-to-client! new-messages ch))
-    new-messages))
+(defn broadcast-messages! [chs messages]
+  (doseq [ch chs]
+    (push-messages! messages ch)))
 
-(defn listen-for-messages! [ch]
-  (let [user-id (new-user-id!)]
-    (go-loop []
-      (if-let [{:keys [message]} (a/<! ch)]
-        (do
-          (send-off !recent-messages process-message! user-id (edn/read-string message))
-          (recur))
-        (swap! !connections disj ch)))))
+(defn process-message! [id {:keys [chat]}]
+  (swap! !recent-messages
+         (fn [messages]
+           (let [new-messages (take 10 (cons {:id id :chat chat} messages))]
+             (send-off !open-chs #(doto % (broadcast-messages! new-messages)))
+             new-messages))))
+
+(defn add-ch [conns ch]
+  (push-messages! @!recent-messages ch)
+  (conj conns ch))
+
+(defn listen-for-messages! [user-id ch]
+  (go-loop []
+    (if-let [{:keys [message]} (a/<! ch)]
+      (do
+        (process-message! user-id (edn/read-string message))
+        (recur))
+      (send !open-chs disj ch))))
 
 (defn user-joined! [req]
   (with-channel req ch
-    (swap! !connections conj ch)
-    (send-messages-to-client! @!recent-messages ch)
-    (listen-for-messages! ch)))
+    (send-off !open-chs add-ch ch)
+    (listen-for-messages! (new-user-id! req) ch)))
 
 (defroutes app-routes
   (GET "/" [] (response (page-frame)))
